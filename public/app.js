@@ -136,6 +136,17 @@ function partitionBadge(c) {
     `Partitioned · ${escapeHtml(c.partitionKey)}</span>`;
 }
 
+/* 名称前缀（RFC 6265bis）：按大小写精确识别，仅入罐校验通过的前缀项会出现于此 */
+function prefixBadge(name) {
+  if (name.startsWith('__Host-') && name.length > '__Host-'.length) {
+    return '<span class="badge prefix" title="__Host-：https 来源 + Secure + 未声明 Domain（host-only）+ 显式 Path=/">__Host- 前缀</span>';
+  }
+  if (name.startsWith('__Secure-') && name.length > '__Secure-'.length) {
+    return '<span class="badge prefix" title="__Secure-：https 来源 + 显式 Secure">__Secure- 前缀</span>';
+  }
+  return '';
+}
+
 function renderJar(cookies) {
   els.jarCount.textContent = String(cookies.length);
 
@@ -167,6 +178,7 @@ function renderJar(cookies) {
       <tr class="${c.expired ? 'expired' : ''}">
         <td class="dim">#${c.index}</td>
         <td class="mono">
+          ${prefixBadge(c.name)}
           <span class="cookie-name">${escapeHtml(c.name)}</span>=<span class="cookie-value">${escapeHtml(c.value)}</span>
         </td>
         <td>

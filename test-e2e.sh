@@ -1305,6 +1305,193 @@ post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
 echo
+echo "------- Cookie 名称前缀 __Secure- / __Host-（大小写精确） -------"
+
+post /api/reset '{}' >/dev/null
+
+echo "== PF1. __Secure- 合法（https + 显式 Secure）入罐 =="
+R=$(post /api/store '{"url":"https://pf.example.com/app","setCookie":"__Secure-t=1; Path=/; Secure; Max-Age=60"}')
+check "__Secure- 入罐成功" '"action":"stored"' "$R"
+check "前缀通过提示" "命中 __Secure- 前缀" "$R"
+
+echo "== PF2. __Secure- 缺 Secure / http 来源 -> 拒绝并逐项说明 =="
+R=$(post /api/store '{"url":"https://pf.example.com/app","setCookie":"__Secure-t=2; Path=/"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "缺少 Secure 条件" "未显式声明 Secure" "$R"
+R=$(post /api/store '{"url":"http://pf.example.com/","setCookie":"__Secure-t=3; Path=/; Secure"}')
+check "http 来源拒绝" '"action":"rejected"' "$R"
+check "https 来源条件" "只接受 https 来源" "$R"
+
+echo "== PF3. __Host- 合法：host-only 且 Path=/ =="
+R=$(post /api/store '{"url":"https://pf.example.com/app","setCookie":"__Host-h=1; Path=/; Secure; Max-Age=60"}')
+check "__Host- 入罐成功" '"action":"stored"' "$R"
+check "host-only" '"hostOnly":true' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['cookie']['path']=='/', d['cookie']
+assert d['cookie']['hostOnly'] is True and d['cookie']['secure'] is True
+print('✅ __Host- 条目 host-only / Path=/ / Secure')" && PASS=$((PASS+1)) || { echo "❌ __Host- 存储属性错误"; FAIL=$((FAIL+1)); }
+
+echo "== PF4. __Host- 声明 Domain -> 拒绝 =="
+R=$(post /api/store '{"url":"https://pf.example.com/","setCookie":"__Host-h=2; Path=/; Secure; Domain=pf.example.com"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "禁止 Domain 条件" "禁止 Domain" "$R"
+
+echo "== PF5. __Host- 缺 Path（取默认路径）/ Path=/sub -> 拒绝 =="
+R=$(post /api/store '{"url":"https://pf.example.com/app","setCookie":"__Host-h=3; Secure"}')
+check "缺 Path 拒绝" '"action":"rejected"' "$R"
+check "须显式 Path=/ 条件" "显式 Path=/" "$R"
+R=$(post /api/store '{"url":"https://pf.example.com/app","setCookie":"__Host-h=4; Path=/sub; Secure"}')
+check "Path=/sub 拒绝" '"action":"rejected"' "$R"
+check "Path 精确为 / 条件" 'path-attribute 精确为' "$R"
+
+echo "== PF6. __Host- 四项条件全违反 -> 一次全部列出 =="
+R=$(post /api/store '{"url":"http://pf.example.com/app","setCookie":"__Host-h=5; Path=/sub; Domain=pf.example.com"}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+r=d['reason']
+assert d['action']=='rejected', d
+for cond in ['只接受 https 来源','未显式声明 Secure','禁止 Domain','path-attribute 精确为']:
+    assert cond in r, (cond, r)
+print('✅ 四个违反条件逐项列出：https / Secure / Domain / Path')" && PASS=$((PASS+1)) || { echo "❌ 违反条件列示不全: $R"; FAIL=$((FAIL+1)); }
+
+echo "== PF7. 前缀拒绝不改变罐内容 / 创建序号 / 时钟 / 容量 =="
+BEFORE=$(curl -s "$BASE/api/jar")
+post /api/store '{"url":"http://pf.example.com/","setCookie":"__Secure-x=1; Path=/; Secure"}' >/dev/null
+post /api/store '{"url":"https://pf.example.com/","setCookie":"__Host-x=2; Secure; Domain=pf.example.com"}' >/dev/null
+post /api/script/write '{"url":"http://pf.example.com/","setCookie":"__Host-x=3; Path=/; Secure"}' >/dev/null
+AFTER=$(curl -s "$BASE/api/jar")
+[ "$BEFORE" = "$AFTER" ] && echo "✅ 前缀拒绝后罐内容、容量、时钟（/api/jar 全量）均不变" && PASS=$((PASS+1)) \
+  || { echo "❌ 前缀拒绝改动了状态"; FAIL=$((FAIL+1)); }
+
+echo "== PF8. Max-Age<=0 删除也先做前缀校验 =="
+# 合法 https+Secure 删除既有的 __Secure-t
+R=$(post /api/store '{"url":"https://pf.example.com/app","setCookie":"__Secure-t=z; Path=/; Secure; Max-Age=0"}')
+check "合法删除动作" '"action":"deleted"' "$R"
+# 非法（http 且无 Secure）删除请求 -> 拒绝，__Host-h 原样保留
+R=$(post /api/store '{"url":"http://pf.example.com/","setCookie":"__Host-h=z; Max-Age=0"}')
+check "非法删除拒绝" '"action":"rejected"' "$R"
+check "拒绝删除说明" "拒绝本次删除" "$R"
+JAR_NAMES=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(','.join(c['name'] for c in json.load(sys.stdin)['cookies']))")
+[ "$JAR_NAMES" = "__Host-h" ] && { echo "✅ __Secure-t 已删、__Host-h 未被非法删除影响（罐：$JAR_NAMES）"; PASS=$((PASS+1)); } \
+  || { echo "❌ 删除校验后罐内容异常：$JAR_NAMES"; FAIL=$((FAIL+1)); }
+# 合法前缀删除不存在的目标：仍按既有规则报「无可删除」
+R=$(post /api/store '{"url":"https://pf.example.com/","setCookie":"__Secure-missing=z; Path=/; Secure; Max-Age=-1"}')
+check "无目标删除" "无可删除" "$R"
+
+echo "== PF9. 大小写不符 / 纯前缀名 按普通名称，沿用原有规则 =="
+R=$(post /api/store '{"url":"http://pf.example.com/","setCookie":"__secure-lc=1"}')
+check "小写 __secure- 普通名入罐" '"action":"stored"' "$R"
+R=$(post /api/store '{"url":"https://pf.example.com/","setCookie":"__HOST-UC=1"}')
+check "大写 __HOST- 普通名入罐" '"action":"stored"' "$R"
+R=$(post /api/store '{"url":"https://pf.example.com/","setCookie":"__Host-=1; Path=/; Secure"}')
+check "恰好 __Host-（无后缀）普通名入罐" '"action":"stored"' "$R"
+if [[ "$R" != *"命中 __Host- 前缀"* ]]; then echo "✅ 纯前缀名不触发前缀提示"; PASS=$((PASS+1));
+else echo "❌ 纯前缀名不应识别为前缀"; FAIL=$((FAIL+1)); fi
+
+echo "== PF10. document.cookie 赋值：同套前缀校验 =="
+R=$(post /api/script/write '{"url":"https://pf.example.com/app","setCookie":"__Host-js=1; Path=/; Secure; Max-Age=30"}')
+check "脚本合法 __Host- 入罐" '"action":"stored"' "$R"
+R=$(post /api/script/write '{"url":"http://pf.example.com/","setCookie":"__Secure-js=1; Path=/; Secure"}')
+check "脚本 http __Secure- 拒绝" '"action":"rejected"' "$R"
+R=$(post /api/script/write '{"url":"https://pf.example.com/app","setCookie":"__Host-js=2; Secure"}')
+check "脚本 __Host- 缺 Path=/ 拒绝" '"action":"rejected"' "$R"
+R=$(post /api/script/write '{"url":"https://pf.example.com/","setCookie":"__Host-js=3; Path=/; Secure; Domain=pf.example.com"}')
+check "脚本 __Host- 带 Domain 拒绝" '"action":"rejected"' "$R"
+
+echo "== PF11. 重定向链中违反前缀的 Set-Cookie 被逐条拒绝（罐不变） =="
+R=$(post /api/redirect-chain '{
+  "startUrl":"https://pf.example.com/start","topUrl":"https://pf.example.com/home",
+  "steps":[{"status":200,"setCookies":["__Host-bad=1; Secure","__Secure-ok=1; Path=/; Secure"]}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+stores=d['hops'][0]['stores']
+assert stores[0]['action']=='rejected' and '显式 Path=/' in stores[0]['reason'], stores[0]
+assert stores[1]['action']=='stored', stores[1]
+names=[c['name'] for c in d['cookies']]
+assert '__Host-bad' not in names and '__Secure-ok' in names, names
+print('✅ 链中 __Host- 违规项拒绝、合法 __Secure- 项入罐')" && PASS=$((PASS+1)) || { echo "❌ 链上前缀处理错误: $R"; FAIL=$((FAIL+1)); }
+
+echo "== PF12. 快照导入：前缀项已保存属性校验 =="
+post /api/reset '{}' >/dev/null
+# 自包含的最小合法快照（2 个前缀项），用 python 派生各类违规变体
+python3 - <<'EOF'
+import json, urllib.request, urllib.error, copy
+base={
+  'format':'cookie-jar-lab-snapshot','version':1,'exportedAt':1000,
+  'cookies':[
+    {'name':'__Secure-a','value':'1','domain':'example.com','path':'/','hostOnly':True,
+     'secure':True,'httpOnly':False,'sameSite':'lax','sameSiteDefault':True,
+     'priority':'medium','priorityDefault':False,'partitioned':False,'partitionKey':None,
+     'creationIndex':1,'createdAt':0,'updatedAt':0,'lastAccessedAt':0},
+    {'name':'__Host-b','value':'2','domain':'example.com','path':'/','hostOnly':True,
+     'secure':True,'httpOnly':False,'sameSite':'lax','sameSiteDefault':True,
+     'priority':'medium','priorityDefault':False,'partitioned':False,'partitionKey':None,
+     'creationIndex':2,'createdAt':0,'updatedAt':0,'lastAccessedAt':0},
+  ],
+  'nextIndex':3,
+  'capacity':{'globalLimit':None,'domainLimits':[]},
+  'clock':{'startedAt':0,'now':0},
+}
+def imp(s):
+    req=urllib.request.Request('http://localhost:3000/api/snapshot/import',
+        data=json.dumps(s).encode(), headers={'Content-Type':'application/json'}, method='POST')
+    try:
+        r=urllib.request.urlopen(req); return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())['error']
+cases=[
+ ('__Secure- 项 secure=false', lambda s: s['cookies'][0].__setitem__('secure',False)),
+ ('__Host- 项 secure=false', lambda s: s['cookies'][1].__setitem__('secure',False)),
+ ('__Host- 项 hostOnly=false', lambda s: s['cookies'][1].__setitem__('hostOnly',False)),
+ ('__Host- 项 path=/app', lambda s: s['cookies'][1].__setitem__('path','/app')),
+ ('小写 __host- 项属性故意不符（放行）', lambda s: s['cookies'][1].__setitem__('name','__host-b')),
+]
+for desc,mut in cases:
+    s=copy.deepcopy(base); mut(s)
+    code,msg=imp(s)
+    if desc.startswith('小写'):
+        assert code==200, (desc,code,msg)
+        print('✅',desc,'-> 200（不按前缀校验）')
+    else:
+        assert code==400 and '前缀约束' in msg, (desc,code,msg)
+        print('✅',desc,'-> 400 整份拒绝')
+# 原合法快照导入成功
+code,msg=imp(copy.deepcopy(base))
+assert code==200, (code,msg)
+print('✅ 合法前缀快照正常导入')
+EOF
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+# 全部非法导入后旧状态（先污染）不被替换
+curl -s -X POST "$BASE/api/store" -H 'Content-Type: application/json' \
+  -d '{"url":"https://keep.example/","setCookie":"keepme=1; Path=/"}' >/dev/null
+BEFORE=$(curl -s "$BASE/api/jar")
+python3 - <<'EOF'
+import json, urllib.request, urllib.error, copy
+s={
+  'format':'cookie-jar-lab-snapshot','version':1,'exportedAt':1000,
+  'cookies':[{'name':'__Host-z','value':'1','domain':'example.com','path':'/x','hostOnly':False,
+     'secure':False,'httpOnly':False,'sameSite':'lax','sameSiteDefault':True,
+     'priority':'medium','priorityDefault':False,'partitioned':False,'partitionKey':None,
+     'creationIndex':1,'createdAt':0,'updatedAt':0,'lastAccessedAt':0}],
+  'nextIndex':2,'capacity':{'globalLimit':None,'domainLimits':[]},'clock':{'startedAt':0,'now':0}}
+req=urllib.request.Request('http://localhost:3000/api/snapshot/import',
+    data=json.dumps(s).encode(), headers={'Content-Type':'application/json'}, method='POST')
+try: urllib.request.urlopen(req)
+except urllib.error.HTTPError as e: assert e.code==400
+EOF
+AFTER=$(curl -s "$BASE/api/jar")
+[ "$BEFORE" = "$AFTER" ] && { echo "✅ 前缀违规快照拒绝后旧罐、容量和时钟均不变"; PASS=$((PASS+1)); } \
+  || { echo "❌ 非法前缀快照改动了状态"; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

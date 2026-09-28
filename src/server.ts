@@ -7,7 +7,11 @@
  *   POST /api/store              { url, setCookie, topUrl?, blockThirdParty? } 顺序处理一次 Set-Cookie 写入（含容量压力淘汰）；
  *                                topUrl 为顶层页面 URL，仅 Partitioned cookie 必需（计算分区键）；
  *                                blockThirdParty=true 开启「屏蔽第三方 Cookie」：topUrl 必填，
- *                                跨站响应拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）
+ *                                跨站响应拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）。
+ *                                名称以 __Secure- / __Host- 开头（大小写精确）的条目按前缀规则强制：
+ *                                __Secure- 仅接受 https 来源且带 Secure；__Host- 还须未声明
+ *                                Domain 且显式 Path=/；Max-Age<=0 的删除也先做同一前缀校验，
+ *                                违反时拒绝并逐项说明，罐内容、序号、时钟与容量均不变
  *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
@@ -26,14 +30,17 @@
  *   POST /api/script/write       { url, setCookie, topUrl?, blockThirdParty? } 演算 document.cookie 赋值：
  *                                复用既有解析/分区身份/容量逻辑；拒绝带 HttpOnly 的赋值，
  *                                以及对同身份未过期 HttpOnly 项的覆盖或 Max-Age 删除
- *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）
+ *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）；
+ *                                __Secure- / __Host- 名称前缀（大小写精确）的强制校验与网络接口相同
+ *                                （__Host- 还须未声明 Domain、显式 Path=/；删除也先校验）
  *   POST /api/capacity           { globalLimit?, domainLimits? } 设置全局/每可注册域容量并立即执行淘汰
  *   GET  /api/snapshot           下载场景快照（带 format/version：原始 Cookie 条目（含分区键、
  *                                创建序号与创建/最近访问时间）、容量规则、时钟起点与当前值、下一序号）
  *   POST /api/snapshot/import    导入场景快照（body 为快照对象本身，或 { snapshot } 包裹）：
  *                                先完整校验结构/时间范围/条目身份唯一性/序号一致性，
- *                                通过后一次性替换罐、容量与时钟；任一校验失败返回 400，
- *                                旧罐、容量和时钟均不变；恢复不执行淘汰，过期项原样保留
+ *                                并校验 __Secure- / __Host- 前缀项已保存的 Secure、host-only
+ *                                与 Path 属性；通过后一次性替换罐、容量与时钟；任一校验失败
+ *                                返回 400，旧罐、容量和时钟均不变；恢复不执行淘汰，过期项原样保留
  *   GET  /api/clock              读取演算时钟（当前演算时间、启动时刻、已推进秒数）
  *   POST /api/clock/advance      { seconds } 以正整数秒推进演算时钟；非法输入（缺省、0、负数、
  *                                非整数、非数字）返回 400，时钟与罐均不变；推进本身不删除条目，

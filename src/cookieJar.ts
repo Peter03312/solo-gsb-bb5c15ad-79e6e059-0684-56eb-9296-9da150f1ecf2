@@ -22,6 +22,14 @@
  *     按 scheme + 可注册域判定响应站与顶层站是否跨站；跨站响应拒绝写入和删除
  *     普通 Cookie（不改动罐、不触发容量淘汰），Partitioned 分区项不受此限，
  *     仍按既有 Secure 与分区键规则处理。
+ *   - Cookie 名称前缀（RFC 6265bis §4.1.3 的 __Secure- / __Host- 前缀）：按名称
+ *     「大小写精确」识别（__secure- / __host- 等大小写不符、或不带前缀的一律按普通名称，
+ *     沿用原有规则）；网络 Set-Cookie 与 document.cookie 赋值都先做此前缀校验，
+ *     带 Max-Age<=0 的删除也先执行同一校验，拒绝发生在任何罐改动之前：
+ *       · __Secure-：仅接受 https 来源，且 Set-Cookie 显式声明 Secure；
+ *       · __Host-：在 __Secure- 两条之外，还必须未声明 Domain（host-only）、
+ *         且显式声明 Path=/（Path 缺省取默认路径不算显式声明）。
+ *     拒绝时在原因中逐项列出违反的条件，罐内容、创建序号、演算时钟与容量均不变。
  *
  *  容量压力模拟（入罐沿用上述全部校验通过后执行）：
  *   - 容量按「条目条数」计，可分别为每个可注册域（eTLD+1；IP/localhost 按完整主机）
@@ -78,7 +86,9 @@
  *     创建/更新/最近访问时间等全部字段）、容量规则（全局与每可注册域上限）、
  *     演算时钟起点与当前值、下一创建序号；
  *   - 导入先做完整校验（结构、时间范围、条目身份唯一性、序号一致性、枚举与布尔字段），
- *     任一不满足即拒绝；全部通过后才一次性替换罐内容、容量规则与时钟——
+ *     并对名称以 __Secure- / __Host-（大小写精确）开头的前缀项校验其已保存的 Secure、
+ *     host-only 与 Path 属性（__Secure- 须 Secure=true；__Host- 还须 hostOnly=true、
+ *     Path="/"）；任一不满足即拒绝；全部通过后才一次性替换罐内容、容量规则与时钟——
  *     失败时旧罐、容量和时钟均不变；
  *   - 恢复是精确状态替换：不执行容量淘汰，过期项原样保留；恢复后后续发送排序
  *     （Path 长度 / 创建序号）、默认 Lax 的 120 秒跨站顶层 POST 宽限（按创建时间）
@@ -725,6 +735,69 @@ export function parseSetCookie(raw: string): ParsedSetCookie {
   return parsed;
 }
 
+/**
+ * 按名称「大小写精确」识别 Cookie 前缀（RFC 6265bis §4.1.3）：
+ *   "__Secure-" 开头（且名称长于前缀）-> 'secure'
+ *   "__Host-"   开头（且名称长于前缀）-> 'host'
+ * 其它任何写法（__secure-、__host-、-Secure 等大小写/形式不符，或不带前缀）一律 null，
+ * 按普通名称沿用原有规则。
+ */
+export function cookieNamePrefix(name: string): 'secure' | 'host' | null {
+  if (name.startsWith('__Host-') && name.length > '__Host-'.length) return 'host';
+  if (name.startsWith('__Secure-') && name.length > '__Secure-'.length) return 'secure';
+  return null;
+}
+
+/**
+ * 写入（网络 Set-Cookie 与 document.cookie 赋值共用）时的前缀强制校验。
+ * 发生在任何罐改动之前：返回非空字符串即拒绝原因（其中逐项列出违反的条件）；
+ * 返回 null 表示通过。带 Max-Age<=0 的删除也先执行同一校验。
+ *   - __Secure-：https 来源 + 显式 Secure；
+ *   - __Host-：以上两条之外，还必须未声明 Domain、显式声明 Path=/。
+ */
+function prefixViolation(
+  parsed: ParsedSetCookie,
+  urlInfo: { protocol: string },
+): string | null {
+  const prefix = cookieNamePrefix(parsed.name);
+  if (prefix === null) return null;
+
+  const violations: string[] = [];
+  if (urlInfo.protocol !== 'https:') {
+    const where = urlInfo.protocol === 'http:'
+      ? `明文 ${urlInfo.protocol}// 来源`
+      : `${urlInfo.protocol}// 来源`;
+    violations.push(`不是 https 来源（当前为${where}，前缀 cookie 只接受 https 来源）`);
+  }
+  if (!parsed.secure) {
+    violations.push('Set-Cookie 未显式声明 Secure');
+  }
+  if (prefix === 'host') {
+    // Domain 属性在解析时：完全未声明 -> undefined；"Domain"（无值/空值）不会被记录，按未声明处理
+    if (parsed.domain !== undefined) {
+      violations.push(`声明了 Domain=${parsed.domain}（__Host- 前缀禁止 Domain，必须 host-only）`);
+    }
+    // Path 必须「显式」声明为 /：缺省或非绝对路径都会走 default-path，不满足
+    if (parsed.path !== '/') {
+      violations.push(
+        parsed.path === undefined
+          ? '未显式声明 Path=/（Path 缺省会取默认路径，__Host- 前缀要求显式 Path=/）'
+          : `Path="${parsed.path}" 不是显式 Path=/（__Host- 前缀要求 path-attribute 精确为 "/"）`,
+      );
+    }
+  }
+
+  if (violations.length === 0) return null;
+  const scope = prefix === 'host'
+    ? '__Host- 前缀（必须：https 来源；显式 Secure；未声明 Domain（host-only）；显式 Path=/）'
+    : '__Secure- 前缀（必须：https 来源；显式 Secure）';
+  return `Cookie 名称 "${parsed.name}" 命中 ${scope}，本次${
+    parsed.maxAge !== undefined && parsed.maxAge <= 0 ? '删除' : '写入'
+  }违反：${violations.join('；')}；拒绝本次${
+    parsed.maxAge !== undefined && parsed.maxAge <= 0 ? '删除' : '写入'
+  }（前缀按名称大小写精确识别，普通名称不受此限），罐内容、创建序号、演算时钟与容量均未改动`;
+}
+
 /** 域规范化：小写并去掉最多一个前导点（RFC 5.3.6） */
 export function canonicalizeDomain(domain: string): string {
   let d = domain.trim().toLowerCase();
@@ -912,6 +985,22 @@ export class CookieJar {
 
     const { host } = urlInfo;
     const notices: string[] = [];
+
+    // ---- 0. Cookie 名称前缀（__Secure- / __Host-，大小写精确）强制校验 ----
+    // 网络 Set-Cookie 与 document.cookie 赋值共用同一校验；带 Max-Age<=0 的删除也先执行。
+    // 拒绝发生在任何罐改动之前：罐内容、创建序号、演算时钟与容量均不变。普通名称不受影响。
+    const prefixViolationReason = prefixViolation(parsed, urlInfo);
+    if (prefixViolationReason !== null) {
+      return this.result(false, 'rejected', prefixViolationReason, notices, parsed);
+    }
+    const namePrefix = cookieNamePrefix(parsed.name);
+    if (namePrefix !== null) {
+      notices.push(
+        namePrefix === 'host'
+          ? '名称命中 __Host- 前缀（大小写精确）：已通过 https 来源、Secure、未声明 Domain（host-only）、显式 Path=/ 全部约束'
+          : '名称命中 __Secure- 前缀（大小写精确）：已通过 https 来源与显式 Secure 约束',
+      );
+    }
 
     // ---- 0a. document.cookie 脚本赋值：HttpOnly 只能由网络 Set-Cookie 设置，脚本无权声明 ----
     // 拒绝发生在任何罐改动之前：罐内容、时间戳与容量均不变。
@@ -2270,7 +2359,9 @@ const PRIORITY_VALUES = new Set<CookiePriority>(['low', 'medium', 'high']);
  *  - 条目身份唯一性：(name, domain, path, partitionKey) 不得重复，创建序号也不得重复；
  *  - 序号一致性：创建序号为 ≥1 的整数且全部小于 nextIndex；
  *  - 枚举 / 布尔字段、SameSite=None 必须 Secure、Partitioned 必须带非空分区键
- *    （未分区必须为 null）、容量上限为 ≥1 的整数等。
+ *    （未分区必须为 null）、容量上限为 ≥1 的整数等；
+ *  - Cookie 名称前缀：名称以 __Secure- / __Host-（大小写精确）开头的条目，其已保存的
+ *    Secure / host-only / Path 属性必须满足前缀约束（__Host- 另须 host-only 且 Path="/"）。
  */
 export function validateSnapshot(input: unknown): JarSnapshot {
   if (!isObject(input)) {
@@ -2426,6 +2517,25 @@ export function validateSnapshot(input: unknown): JarSnapshot {
         throw new Error(`快照${label}未分区（partitioned=false），partitionKey 必须为 null；旧罐、容量和时钟均不变`);
       }
       partitionKey = null;
+    }
+
+    // Cookie 名称前缀（__Secure- / __Host-，大小写精确）：校验已保存的属性是否满足前缀约束。
+    // __Secure- 仅要求 Secure；__Host- 另要求 host-only（未声明 Domain）且 Path 精确为 "/"。
+    const namePrefix = cookieNamePrefix(name);
+    if (namePrefix !== null) {
+      const prefixChecks: string[] = [];
+      if (!secure) prefixChecks.push('Secure=true');
+      if (namePrefix === 'host') {
+        if (!hostOnly) prefixChecks.push('hostOnly=true（未声明 Domain）');
+        if (path !== '/') prefixChecks.push('path="/"（显式 Path=/）');
+      }
+      if (prefixChecks.length > 0) {
+        throw new Error(
+          `快照${label}的名称 "${name}" 以 ${namePrefix === 'host' ? '__Host-' : '__Secure-'} 前缀开头` +
+          `（按大小写精确识别），但其已保存属性不满足前缀约束：应为 ${prefixChecks.join('、')}` +
+          `（实际 secure=${secure}、hostOnly=${hostOnly}、path="${path}"）；整份快照拒绝导入，旧罐、容量和时钟均不变`,
+        );
+      }
     }
 
     // 序号：正整数、唯一、且严格小于 nextIndex

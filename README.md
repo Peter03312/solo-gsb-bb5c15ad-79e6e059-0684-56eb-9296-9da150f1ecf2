@@ -14,6 +14,12 @@
 可注册域**（IP、localhost 用完整主机）；普通项与不同分区的同名同域同路径项并存，
 发送时只随分区键相同的顶层页面发送，其余分区项在排除明细中说明原因。
 
+同时实现 RFC 6265bis 的 **`__Secure-` / `__Host-` 名称前缀**（按名称**大小写精确**
+识别）：`__Secure-` 开头的条目只接受 **https 来源 + 显式 Secure**；`__Host-` 开头还须
+**未声明 Domain（host-only）且显式 `Path=/`**。网络 Set-Cookie 与 document.cookie
+赋值同一套校验，**`Max-Age<=0` 的删除也先执行同一校验**；违反时拒绝并逐项说明条件，
+**罐内容、创建序号、演算时钟与容量均不变**；快照导入也校验前缀项已保存的这些属性。
+
 另有可选的 **屏蔽第三方 Cookie** 模式（默认关闭，界面开关对应 API 的 `blockThirdParty`
 参数）：开启后必须提供有效顶层页面 URL，按 **scheme + 可注册域** 判定它与响应/请求 URL
 是否跨站——**跨站响应拒绝写入和删除普通 Cookie**（不改动罐、不触发容量淘汰），
@@ -58,7 +64,8 @@ URL 顺序写入该跳的 Set-Cookie**。**末跳必须为 200 且无 Location**
 JSON，完整保存**原始 Cookie 条目**（含分区键、创建序号、创建/更新/最近访问时间等
 全部字段）、**容量规则**（全局与每可注册域上限）、**演算时钟起点与当前值**及
 **下一创建序号**。导入时**先完整校验**（结构、时间范围、条目身份唯一性、序号
-一致性、枚举约束），全部通过后才**一次性替换罐、容量规则与时钟**——任一校验失败
+一致性、枚举约束，以及 `__Secure-` / `__Host-` 前缀项已保存的 Secure、host-only、
+Path 属性），全部通过后才**一次性替换罐、容量规则与时钟**——任一校验失败
 返回 400，**旧罐、容量和时钟均不变**。恢复是精确状态替换、**不执行容量淘汰**：
 **过期项原样保留**，恢复后的发送排序、默认 Lax 宽限与容量淘汰与导出前的连续操作
 完全一致。
@@ -319,6 +326,18 @@ Partitioned（CHIPS）演算示例（写入时填「顶层页面 URL」，发送
   - **Partitioned 分区项不受此限**：跨站响应中仍按既有 Secure 与分区键规则正常
     入罐 / 覆盖 / 删除；
   - 拒绝结果在 `reason` 中说明策略原因（含响应站 / 顶层站对比）。
+- **Cookie 名称前缀**（RFC 6265bis `__Secure-` / `__Host-`，**按名称大小写精确识别**）
+  - 名称以 `__Secure-` 开头：**仅接受 https 来源**，且 Set-Cookie **显式声明 `Secure`**；
+  - 名称以 `__Host-` 开头：在上面两条之外，还必须**未声明 `Domain`**（host-only）、
+    **显式声明 `Path=/`**（Path 缺省取默认路径、或写成 `/app` 等其它值都不满足）；
+  - **网络 `Set-Cookie` 与 `document.cookie` 赋值同一套校验**，且
+    **`Max-Age<=0` 的删除也先执行同一校验**；任一条件不满足即**拒绝**，
+    `reason` 中**逐项列出违反的条件**；
+  - 拒绝发生在任何罐改动**之前**：**罐内容、创建序号、演算时钟与容量均不变**；
+  - 大小写不符（`__secure-`、`__HOST-`…）或名称恰好只有前缀（`__Host-`）一律
+    **按普通名称**处理，沿用原有规则；
+  - 快照导入时同样校验前缀项**已保存**的 Secure、host-only 与 Path 属性，任一不符
+    **整份快照拒绝**且旧状态不变。
 - **同名同域同路径（分区项还需同分区键）**再次写入 → 覆盖更新，**沿用首次创建序号**
   （保证排序稳定），并刷新该条目的最近访问时间；普通项与各分区项互不覆盖。
 - **容量压力淘汰**（入罐通过以上全部校验后执行；未设置任何上限时完全不干预）
@@ -427,6 +446,10 @@ Partitioned（CHIPS）演算示例（写入时填「顶层页面 URL」，发送
 两条脚本专属拒绝都发生在任何罐改动**之前**，因此**罐内容、全部时间戳（createdAt /
 updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量淘汰。
 
+`__Secure-` / `__Host-` 名称前缀（大小写精确）的强制校验在脚本路径与网络路径
+**完全相同**（`__Host-` 同样要求未声明 Domain 且显式 `Path=/`，`Max-Age<=0` 删除
+也先校验）；前缀拒绝同样不改变罐内容、创建序号、演算时钟与容量。
+
 **网络接口不受影响**：`/api/store` 仍可写入、覆盖、删除 HttpOnly 项，`/api/send`
 仍会在请求头中发送通过筛选的 HttpOnly 项——HttpOnly 只隔离页面脚本，不隔离网络栈。
 
@@ -469,7 +492,10 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
   - **序号一致性**：创建序号为 ≥1 的整数且**严格小于** `nextIndex`；
   - 枚举/布尔字段合法（sameSite ∈ strict/lax/none、priority ∈ low/medium/high）；
     `SameSite=None` 必须 `secure=true`；`partitioned=true` 必须带非空 `partitionKey`，
-    未分区必须为 `null`；容量上限为 `null` 或 ≥1 的整数。
+    未分区必须为 `null`；容量上限为 `null` 或 ≥1 的整数；
+  - **Cookie 名称前缀**：名称以 `__Secure-` / `__Host-`（大小写精确）开头的条目，
+    其已保存属性必须满足前缀约束——`__Secure-` 须 `secure=true`；`__Host-` 还须
+    `hostOnly=true`（未声明 Domain）且 `path="/"`；任一不符**整份快照拒绝**。
 - **原子替换**：全部校验通过后才一次性替换罐内容、容量规则（含时钟起点 `startedAt`）
   与当前时钟；**任一校验失败返回 400，旧罐、容量和时钟均不变**。
 - **恢复语义**：恢复是精确状态替换，**不执行容量淘汰**，**过期项原样保留**；
@@ -488,14 +514,14 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
 | GET | `/api/jar` | — | 当前罐快照（`cookies` + `capacity`：容量设置与各可注册域用量 + `clock`：演算时钟） |
 | GET | `/api/clock` | — | 读取演算时钟：`now`/`readable`（当前演算时间）、`startedAt`/`startedAtReadable`（启动时刻）、`elapsedSeconds`（已推进秒数） |
 | POST | `/api/clock/advance` | `{ "seconds": 120 }` | 以**正整数秒**推进演算时钟（数字或数字字符串均可）；非法输入（缺省、0、负数、非整数、非数字）返回 400 且**时钟与罐均不变**。推进本身不删除条目，响应附最新 `clock`、`cookies` 与 `capacity`（过期/剩余展示随新时间刷新） |
-| POST | `/api/store` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 顺序写入一条 Set-Cookie；`topUrl` 为顶层页面 URL，仅 `Partitioned` cookie 必需（计算分区键），普通 cookie 可省略。`blockThirdParty=true` 开启屏蔽第三方 Cookie：此时 `topUrl` 必填且须有效，跨站响应拒绝写入/删除普通 Cookie（不改动罐、不触发容量淘汰），Partitioned 分区项不受影响。响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
+| POST | `/api/store` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 顺序写入一条 Set-Cookie；`topUrl` 为顶层页面 URL，仅 `Partitioned` cookie 必需（计算分区键），普通 cookie 可省略。`blockThirdParty=true` 开启屏蔽第三方 Cookie：此时 `topUrl` 必填且须有效，跨站响应拒绝写入/删除普通 Cookie（不改动罐、不触发容量淘汰），Partitioned 分区项不受影响。**名称前缀（大小写精确）强制**：`__Secure-` 仅接受 https 来源且带 Secure；`__Host-` 还须未声明 Domain 且显式 `Path=/`；`Max-Age<=0` 删除也先做同一校验，违反时拒绝并逐项说明，罐内容、序号、时钟与容量均不变。响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
 | POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true, "blockThirdParty"?: false }` | 演算 Cookie 头与逐项原因；请求分区键由顶层页面 URL（缺省取请求 URL）计算并以 `partitionKey` 返回，仅键相同的 `Partitioned` 项发送。`blockThirdParty=true` 时 `topUrl` 必填且须有效，跨站请求排除普通 Cookie（不刷新其最近访问时间），分区键匹配的 Partitioned 项仍可发送；响应以 `blockThirdParty` 回显开关状态。**HttpOnly 项照常发送**。发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
 | POST | `/api/redirect-chain` | `{ "startUrl": "...", "method"?: "POST", "topUrl": "...", "topLevelNav"?: true, "blockThirdParty"?: false, "steps": [{ "status": 303, "location"?: "/相对或绝对", "setCookies"?: ["a=b; Path=/"] }] }` | **重定向链演算（1~8 步）**：先整链预校验（起始/顶层 URL、每跳 http(s) 目标、状态码与 Location 组合、Set-Cookie 列表类型），失败返回 400 且**罐保持不变**。通过后逐跳执行：每跳先按现有规则生成 Cookie 头（`hops[].send` 同 `/api/send` 的完整逐项结果），再按响应 URL 顺序逐条写入 `setCookies`（`hops[].stores[]` 同 `/api/store` 的动作 / 原因 / 淘汰）。前 N-1 步必须是 301/302/303/307/308 且带 Location（相对值基于当前 URL 解析，结果须 http(s)）；**末步必须 200 且无 Location**。303 之后改 GET（HEAD 保留），301/302 仅 POST 改 GET，307/308 保留方法；`hops[].methodNote` 说明改写；`topUrl` / `topLevelNav` / `blockThirdParty` 整条链沿用。成功响应附最终 `hops`（各跳 URL、方法、Cookie 头、写入结果、跳后罐 `jarAfter`）、全罐 `cookies` 与 `capacity` |
 | POST | `/api/script/read` | `{ "url": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 读取演算（页面 JS 视角）**：按既有 过期/分区/第三方屏蔽/Domain/Path/Secure 顺序筛选，**最后再排除 HttpOnly**；**不应用 SameSite、不刷新最近访问时间、不改动罐**。可读项沿用请求头排序（Path 长度降序、创建序号升序），以 `cookieString`（`; ` 拼接）返回，并在 `readable` / `excluded` 中逐项说明原因；上下文字段同 `/api/send`（页面站、顶层站、`partitionKey`、开关回显） |
-| POST | `/api/script/write` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 赋值演算**：复用 `/api/store` 的解析、分区身份与容量逻辑，但**拒绝带 HttpOnly 的赋值**，并**拒绝覆盖或以 `Max-Age<=0` 删除同身份（name、domain、path、分区键）且未过期的 HttpOnly 项**（已过期的不在保护之列）；脚本专属拒绝在改动罐前返回，**罐内容、时间戳与容量不变**。响应结构同 `/api/store`（`action`/`reason`/`jar`/`eviction`） |
+| POST | `/api/script/write` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 赋值演算**：复用 `/api/store` 的解析、分区身份与容量逻辑，但**拒绝带 HttpOnly 的赋值**，并**拒绝覆盖或以 `Max-Age<=0` 删除同身份（name、domain、path、分区键）且未过期的 HttpOnly 项**（已过期的不在保护之列）；脚本专属拒绝在改动罐前返回，**罐内容、时间戳与容量不变**。`__Secure-` / `__Host-` 名称前缀（大小写精确）的强制校验与网络接口完全相同（`__Host-` 还须未声明 Domain、显式 `Path=/`；删除也先校验）。响应结构同 `/api/store`（`action`/`reason`/`jar`/`eviction`） |
 | POST | `/api/capacity` | `{ "globalLimit"?: number \| null, "domainLimits"?: { "example.com": 3 } }` | 替换式设置全局 / 每可注册域容量（正整数；`null`/缺省 = 不限），立即执行一轮淘汰并返回报告 |
 | GET | `/api/snapshot` | — | 下载**场景快照**（`snapshot` 字段）：带 `format`/`version` 的 JSON，含全部原始 Cookie 条目（分区键、创建序号、创建/更新/最近访问时间，过期项也在）、容量规则、演算时钟起点与当前值、下一创建序号；响应另附 `cookieCount`、`clock`、`capacity` |
-| POST | `/api/snapshot/import` | 快照对象本身，或 `{ "snapshot": {...} }` | **导入场景快照**：先完整校验结构 / 时间范围 / 条目身份唯一性 / 序号一致性 / 枚举约束（非法 JSON 或体积超 2MB 同样 400），通过后一次性替换罐、容量规则与时钟；失败返回 400 且**旧罐、容量和时钟均不变**。成功响应含 `restoredCount`、`domainLimitCount`、`globalLimit`、`clock`、`capacity`、`jar`（过期项保留）、`snapshot` |
+| POST | `/api/snapshot/import` | 快照对象本身，或 `{ "snapshot": {...} }` | **导入场景快照**：先完整校验结构 / 时间范围 / 条目身份唯一性 / 序号一致性 / 枚举约束 / **`__Secure-`、`__Host-` 前缀项已保存的 Secure、host-only、Path 属性**（非法 JSON 或体积超 2MB 同样 400），通过后一次性替换罐、容量规则与时钟；失败返回 400 且**旧罐、容量和时钟均不变**。成功响应含 `restoredCount`、`domainLimitCount`、`globalLimit`、`clock`、`capacity`、`jar`（过期项保留）、`snapshot` |
 | POST | `/api/reset` | — | 清空内存罐（**容量设置保留**；**演算时钟同步回到服务启动时刻**，响应附复位后的 `clock`） |
 
 curl 示例：
@@ -623,6 +649,44 @@ curl -s -X POST http://localhost:3000/api/script/write \
 curl -s -X POST http://localhost:3000/api/script/write \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://shop.example.com/admin/dashboard","setCookie":"sid=hacked"}'
+
+# __Secure- 前缀：https 来源 + 显式 Secure，入罐（notices 含「命中 __Secure- 前缀」）
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://shop.example.com/app",
+       "setCookie":"__Secure-session=tok; Path=/; Secure; SameSite=None; Max-Age=3600"}'
+
+# __Secure- 缺 Secure（或来源是 http）-> 拒绝，逐项说明违反条件，罐内容/序号/时钟/容量均不变
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://shop.example.com/app","setCookie":"__Secure-session=tok; Path=/"}'
+
+# __Host- 前缀：https + Secure + 未声明 Domain（host-only）+ 显式 Path=/，入罐
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://shop.example.com/","setCookie":"__Host-csrf=abc; Path=/; Secure; Max-Age=3600"}'
+
+# __Host- 带 Domain（或缺 Path / Path 非 "/"）-> 拒绝；下面一条同时违反多条会被逐项列出
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://shop.example.com/app",
+       "setCookie":"__Host-csrf=abc; Path=/app; Domain=shop.example.com"}'
+
+# Max-Age=0 删除同样先过前缀校验：https + Secure 才允许删除 __Secure- 项
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://shop.example.com/app",
+       "setCookie":"__Secure-session=; Path=/; Secure; Max-Age=0"}'
+
+# document.cookie 赋值使用同一套前缀校验（__Host- 缺显式 Path=/ -> 拒绝）
+curl -s -X POST http://localhost:3000/api/script/write \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://shop.example.com/","setCookie":"__Host-csrf=abc; Secure"}'
+
+# 大小写不符（__secure- / __HOST-）按普通名称处理，沿用原有规则（http 写 Secure 仅提示）
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://shop.example.com/","setCookie":"__secure-plain=1; Secure"}'
 ```
 
 ---
@@ -637,7 +701,7 @@ curl -s -X POST http://localhost:3000/api/script/write \
 ├── tsconfig.json
 ├── src
 │   ├── server.ts           # Express 入口与 API（含容量设置、document.cookie 脚本读写、重定向链演算、演算时钟读取/推进、场景快照下载/导入接口）
-│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰/重定向链/document.cookie 脚本视角/演算时钟/场景快照导出与完整校验导入）
+│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/__Secure-·__Host- 名称前缀/容量淘汰/重定向链/document.cookie 脚本视角/演算时钟/场景快照导出与完整校验导入）
 └── public
     ├── index.html          # 原生前端页面（含重定向链面板、顶层 URL 输入、容量压力配置、document.cookie 演算、演算时钟与场景快照下载/导入面板）
     ├── styles.css
@@ -663,6 +727,10 @@ npm run dev
 > 说明：本工具是**演算/教学工具**，Cookie 仅存于服务端进程内存，刻意聚焦
 > Domain / Path / Max-Age / Secure / SameSite / Priority / **Partitioned（CHIPS 分区）**
 > 与容量压力淘汰等规则；
+> **`__Secure-` / `__Host-` 名称前缀**（RFC 6265bis）按名称大小写精确识别并在
+> 网络 / 脚本两条写入路径（含 `Max-Age<=0` 删除）统一强制：`__Secure-` 须 https
+> 来源 + Secure，`__Host-` 另须未声明 Domain 且显式 `Path=/`，拒绝逐项说明且
+> 罐内容、序号、时钟、容量不变；快照导入同样校验前缀项的这些已保存属性。
 > **HttpOnly** 按浏览器真实语义在两条路径上区分：**网络接口**（`/api/store` 写入、
 > `/api/send` 请求头）可正常写入 / 更新 / 删除 / 发送 HttpOnly 项（仅在罐表格中展示标签）；
 > **页面脚本接口**（`/api/script/read`、`/api/script/write`）读取时一律排除 HttpOnly、
