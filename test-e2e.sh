@@ -1008,6 +1008,182 @@ check "重置提示时钟复位" "演算时钟" "$R"
 post /api/reset '{}' >/dev/null
 
 echo
+echo "------- Cookie 名称前缀 __Secure- / __Host-（RFC 6265bis）演算 -------"
+# 前缀按名称大小写精确识别：__Secure- 要求 HTTPS 来源 + Secure；
+# __Host- 还要求未声明 Domain（host-only）+ 显式 Path=/。
+# 网络 /api/store 与脚本 /api/script/write 同规则；Max-Age<=0 删除也先校验；
+# 拒绝时罐内容、创建序号、演算时钟与容量均不变。
+
+post /api/reset '{}' >/dev/null
+
+echo "== P1. __Secure- 合法（HTTPS + Secure） -> 入罐 =="
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"__Secure-id=a; Path=/; Secure; Max-Age=60"}')
+check "入罐" '"action":"stored"' "$R"
+check "前缀满足提示" "__Secure- 开头" "$R"
+
+echo "== P2. __Secure- 明文 http 来源 -> 拒绝并说明违反条件 =="
+R=$(post /api/store '{"url":"http://example.com/","setCookie":"__Secure-id=b; Path=/; Secure"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "前缀识别" "__Secure- 前缀" "$R"
+check "违反条件（非 HTTPS）" "来源不是 HTTPS" "$R"
+check "状态不变声明" "罐内容、创建序号、演算时钟与容量均不变" "$R"
+
+echo "== P3. __Secure- HTTPS 但缺 Secure -> 拒绝 =="
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"__Secure-id=c; Path=/"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "违反条件（缺 Secure）" "未声明 Secure 属性" "$R"
+
+echo "== P4. 小写 __secure- 不算前缀：沿用普通规则（http 仅给 Secure 提示） =="
+R=$(post /api/store '{"url":"http://example.com/","setCookie":"__secure-x=1; Path=/; Secure"}')
+check "普通规则入罐" '"action":"stored"' "$R"
+if [[ "$R" != *"前缀"* ]]; then echo "✅ 小写 __secure- 无前缀约束"; PASS=$((PASS+1));
+else echo "❌ 小写写法不应按前缀处理"; FAIL=$((FAIL+1)); fi
+
+echo "== P5. __Host- 合法（HTTPS + Secure + 无 Domain + Path=/） -> 入罐 =="
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"__Host-sid=abc; Path=/; Secure; HttpOnly"}')
+check "入罐" '"action":"stored"' "$R"
+check "前缀满足提示" "__Host- 开头" "$R"
+
+echo "== P6. __Host- 三项缺陷（http + Domain + Path=/x + 缺 Secure）一次列全 =="
+R=$(post /api/store '{"url":"http://example.com/","setCookie":"__Host-bad=1; Domain=example.com; Path=/x"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "非 HTTPS" "来源不是 HTTPS" "$R"
+check "缺 Secure" "未声明 Secure 属性" "$R"
+check "带 Domain" "不允许 Domain" "$R"
+check "Path 非 /" '显式 Path 必须正好是' "$R"
+
+echo "== P7. __Host- Path 缺省（默认目录）也不满足显式 Path=/ -> 拒绝 =="
+R=$(post /api/store '{"url":"https://example.com/admin","setCookie":"__Host-s=1; Secure"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "未显式 Path=/" "未显式声明 Path=/" "$R"
+
+echo "== P8. __Host- 相对 Path（Path=admin）同样拒绝 =="
+R=$(post /api/store '{"url":"https://example.com/admin/x","setCookie":"__Host-s=1; Path=admin; Secure"}')
+check "拒绝" '"action":"rejected"' "$R"
+
+echo "== P9. __Hostish（无连字符）是普通名称，http 也可入 =="
+R=$(post /api/store '{"url":"http://example.com/","setCookie":"__Hostish=1; Path=/"}')
+check "普通名称入罐" '"action":"stored"' "$R"
+
+echo "== P10. 合法 __Secure- 删除（Max-Age=0，带 Secure 走 https） =="
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"__Secure-id=; Path=/; Secure; Max-Age=0"}')
+check "删除" '"action":"deleted"' "$R"
+
+echo "== P11. 删除也先校验：__Secure- 明文 http 删除 -> 拒绝且罐不变 =="
+post /api/store '{"url":"https://example.com/","setCookie":"__Secure-del=1; Path=/; Secure"}' >/dev/null
+JAR_BEFORE=$(curl -s "$BASE/api/jar")
+R=$(post /api/store '{"url":"http://example.com/","setCookie":"__Secure-del=; Path=/; Secure; Max-Age=0"}')
+check "删除被拒" '"action":"rejected"' "$R"
+check "删除校验说明" "删除前校验未通过" "$R"
+JAR_AFTER=$(curl -s "$BASE/api/jar")
+[ "$JAR_BEFORE" = "$JAR_AFTER" ] && { echo "✅ 前缀删除被拒后罐内容不变"; PASS=$((PASS+1)); } \
+|| { echo "❌ 前缀删除被拒却改动了罐"; FAIL=$((FAIL+1)); }
+
+echo "== P12. __Host- 删除缺 Path=/ -> 拒绝；补齐 Path=/ + 负 Max-Age -> 删除 =="
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"__Host-sid=; Secure; Max-Age=0"}')
+check "缺 Path=/ 删除被拒" '"action":"rejected"' "$R"
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"__Host-sid=; Path=/; Secure; Max-Age=-1"}')
+check "合法删除" '"action":"deleted"' "$R"
+
+echo "== P13. 拒绝不占用创建序号（#序号连续） =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"keep=1; Path=/"}' >/dev/null
+post /api/store '{"url":"http://example.com/","setCookie":"__Secure-n=1; Path=/; Secure"}' >/dev/null
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"next=2; Path=/"}')
+NEXT_IDX=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookie']['index'])")
+[ "$NEXT_IDX" = "2" ] && { echo "✅ 拒绝未占用序号，新条目序号 #2（实际 #$NEXT_IDX）"; PASS=$((PASS+1)); } \
+|| { echo "❌ 序号不连续，期望 2 实际 $NEXT_IDX"; FAIL=$((FAIL+1)); }
+
+echo "== P14. 拒绝不触发容量淘汰（eviction=null，过期项不被顺带清理） =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"exp=1; Path=/; Max-Age=10"}' >/dev/null
+adv 20
+post /api/capacity '{"globalLimit":1}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"live=1; Path=/; Max-Age=100"}' >/dev/null
+R=$(post /api/store '{"url":"http://example.com/","setCookie":"__Host-x=1; Path=/; Secure"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "无淘汰报告" '"eviction":null' "$R"
+JAR_NAMES=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(','.join(c['name'] for c in json.load(sys.stdin)['cookies']))")
+[ "$JAR_NAMES" = "live" ] && { echo "✅ 拒绝未触发任何淘汰，罐仍只有 live"; PASS=$((PASS+1)); } \
+|| { echo "❌ 拒绝意外触发淘汰：$JAR_NAMES"; FAIL=$((FAIL+1)); }
+
+echo "== P15. document.cookie 赋值走同一前缀校验（缺 Secure 拒绝；合法可入） =="
+R=$(post /api/script/write '{"url":"https://example.com/","setCookie":"__Host-k=1; Path=/"}')
+check "脚本 __Host- 缺 Secure 拒绝" '"action":"rejected"' "$R"
+R=$(post /api/script/write '{"url":"https://example.com/","setCookie":"__Secure-k=1; Path=/; Secure"}')
+check "脚本 __Secure- 合法入罐" '"action":"stored"' "$R"
+R=$(post /api/script/write '{"url":"http://example.com/","setCookie":"__Secure-k=; Path=/; Secure; Max-Age=0"}')
+check "脚本删除也先前缀校验" '"action":"rejected"' "$R"
+
+echo "== P16. 重定向链：坏前缀条拒绝但不影响同跳其它条与整条链 =="
+post /api/reset '{}' >/dev/null
+R=$(post /api/redirect-chain '{"startUrl":"https://example.com/","topUrl":"https://example.com/",
+  "steps":[{"status":200,"setCookies":["__Host-bad=1; Path=/; Secure; Domain=example.com","__Host-ok=1; Path=/; Secure"]}]}')
+check "链成功" '"ok":true' "$R"
+check "坏前缀条拒绝" '"action":"rejected"' "$R"
+check "好前缀条入罐" '"action":"stored"' "$R"
+JAR_NAMES=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(','.join(c['name'] for c in json.load(sys.stdin)['cookies']))")
+[ "$JAR_NAMES" = "__Host-ok" ] && { echo "✅ 链后罐仅 __Host-ok"; PASS=$((PASS+1)); } \
+|| { echo "❌ 链后罐异常：$JAR_NAMES"; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== P17. 快照导入：前缀项已保存的 Secure/host-only/Path 不符 -> 整份拒绝，旧状态不变 =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"__Host-ha=1; Path=/; Secure"}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"__Secure-sb=2; Path=/; Secure"}' >/dev/null
+PREFIX_SNAP="$(dirname "$0")/test-prefix-snapshot.tmp.json"
+curl -s "$BASE/api/snapshot" -o "$PREFIX_SNAP"
+prefix_snapshot_reject() { # python-mutation-desc
+  local desc="$1"; local mut="$2"
+  CODE=$(python3 - "$PREFIX_SNAP" "$mut" <<'EOF'
+import sys,json,urllib.request,urllib.error,copy
+s=json.load(open(sys.argv[1]))['snapshot']
+mut=sys.argv[2]
+if mut=='host_insecure': s['cookies'][0]['secure']=False
+elif mut=='host_domain': s['cookies'][0]['hostOnly']=False
+elif mut=='host_path': s['cookies'][0]['path']='/x'
+elif mut=='secure_insecure': s['cookies'][1]['secure']=False
+elif mut=='lowercase': s['cookies'][0]['name']='__host-ha'
+req=urllib.request.Request('http://localhost:3000/api/snapshot/import',
+    data=json.dumps(s).encode(), headers={'Content-Type':'application/json'}, method='POST')
+try:
+    urllib.request.urlopen(req); print(200)
+except urllib.error.HTTPError as e:
+    print(e.code)
+EOF
+)
+  [ "$CODE" = "400" ] && { echo "✅ $desc -> 400"; PASS=$((PASS+1)); } || { echo "❌ $desc 应 400，实际 $CODE"; FAIL=$((FAIL+1)); }
+}
+JAR_BEFORE=$(curl -s "$BASE/api/jar")
+prefix_snapshot_reject "__Host- 项 secure=false" host_insecure
+prefix_snapshot_reject "__Host- 项 hostOnly=false" host_domain
+prefix_snapshot_reject "__Host- 项 path=/x" host_path
+prefix_snapshot_reject "__Secure- 项 secure=false" secure_insecure
+JAR_AFTER=$(curl -s "$BASE/api/jar")
+if [ "$JAR_BEFORE" = "$JAR_AFTER" ]; then echo "✅ 前缀快照全部拒绝后旧罐、容量和时钟均不变"; PASS=$((PASS+1));
+else echo "❌ 前缀快照拒绝改动了旧状态"; FAIL=$((FAIL+1)); fi
+# 小写改名后不再是前缀：hostOnly/secure 仍合法，应放行（200）——放在不变性对比之后
+CODE_LOWER=$(python3 - "$PREFIX_SNAP" <<'EOF'
+import sys,json,urllib.request,urllib.error
+s=json.load(open(sys.argv[1]))['snapshot']
+s['cookies'][0]['name']='__host-ha'
+req=urllib.request.Request('http://localhost:3000/api/snapshot/import',
+    data=json.dumps(s).encode(), headers={'Content-Type':'application/json'}, method='POST')
+try:
+    urllib.request.urlopen(req); print(200)
+except urllib.error.HTTPError as e:
+    print(e.code)
+EOF
+)
+[ "$CODE_LOWER" = "200" ] && { echo "✅ 小写 __host-ha 不按前缀校验 -> 200"; PASS=$((PASS+1)); } \
+|| { echo "❌ 小写名称应放行，实际 $CODE_LOWER"; FAIL=$((FAIL+1)); }
+rm -f "$PREFIX_SNAP"
+# 恢复干净场景
+post /api/reset '{}' >/dev/null
+
+echo
 echo "------- 场景快照（/api/snapshot + /api/snapshot/import）演算 -------"
 
 SNAP_FILE="$(dirname "$0")/test-snapshot.tmp.json"

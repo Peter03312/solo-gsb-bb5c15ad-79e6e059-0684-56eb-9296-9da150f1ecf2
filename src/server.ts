@@ -7,7 +7,11 @@
  *   POST /api/store              { url, setCookie, topUrl?, blockThirdParty? } 顺序处理一次 Set-Cookie 写入（含容量压力淘汰）；
  *                                topUrl 为顶层页面 URL，仅 Partitioned cookie 必需（计算分区键）；
  *                                blockThirdParty=true 开启「屏蔽第三方 Cookie」：topUrl 必填，
- *                                跨站响应拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）
+ *                                跨站响应拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）。
+ *                                名称按大小写精确识别 __Secure- / __Host- 前缀（RFC 6265bis）：
+ *                                __Secure- 仅接受 HTTPS 来源且带 Secure；__Host- 还须未声明 Domain
+ *                                （host-only）且显式 Path=/；Max-Age<=0 删除也先执行同一校验，
+ *                                拒绝时说明违反的条件，罐内容、创建序号、演算时钟与容量均不变
  *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
@@ -26,7 +30,9 @@
  *   POST /api/script/write       { url, setCookie, topUrl?, blockThirdParty? } 演算 document.cookie 赋值：
  *                                复用既有解析/分区身份/容量逻辑；拒绝带 HttpOnly 的赋值，
  *                                以及对同身份未过期 HttpOnly 项的覆盖或 Max-Age 删除
- *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）
+ *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）。
+ *                                __Secure- / __Host- 前缀校验与 /api/store 完全一致：HTTPS + Secure，
+ *                                __Host- 还须无 Domain 且显式 Path=/；删除（Max-Age<=0）同样先校验
  *   POST /api/capacity           { globalLimit?, domainLimits? } 设置全局/每可注册域容量并立即执行淘汰
  *   GET  /api/snapshot           下载场景快照（带 format/version：原始 Cookie 条目（含分区键、
  *                                创建序号与创建/最近访问时间）、容量规则、时钟起点与当前值、下一序号）
